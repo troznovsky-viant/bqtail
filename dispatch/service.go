@@ -27,7 +27,6 @@ import (
 	"path"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -38,6 +37,11 @@ var maxBqJobListLoopback = 6 * time.Hour
 type Service interface {
 	Dispatch(ctx context.Context) *contract.Response
 	Config() *Config
+	// SetCycleHook registers a callback invoked after every successful dispatch
+	// cycle, with the wall-clock time the cycle completed. Intended for liveness
+	// probes / heartbeats. Must be called before Dispatch is invoked. Pass nil
+	// to clear. Safe to leave unset.
+	SetCycleHook(hook func(time.Time))
 }
 
 type service struct {
@@ -46,6 +50,12 @@ type service struct {
 	config    *Config
 	fs        afs.Service
 	bq        bq.Service
+	cycleHook func(time.Time)
+}
+
+// SetCycleHook registers a per-cycle completion callback. See Service.SetCycleHook.
+func (s *service) SetCycleHook(hook func(time.Time)) {
+	s.cycleHook = hook
 }
 
 // Config returns service config
@@ -91,19 +101,22 @@ func (s *service) Dispatch(ctx context.Context) *contract.Response {
 // Dispatch dispatched BigQuery event
 func (s *service) dispatch(ctx context.Context, response *contract.Response) error {
 	timeInSec := toolbox.AsInt(os.Getenv("FUNCTION_TIMEOUT_SEC"))
-	remainingDuration := (time.Duration(timeInSec) * time.Second) - thinkTime
-	timeoutDuration := s.config.TimeToLive()
-	if timeoutDuration < remainingDuration && remainingDuration > 0 {
-		timeoutDuration = remainingDuration
+	if timeInSec > 0 {
+		remainingDuration := (time.Duration(timeInSec) * time.Second) - thinkTime
+		timeoutDuration := s.config.TimeToLive()
+		if timeoutDuration < remainingDuration && remainingDuration > 0 {
+			timeoutDuration = remainingDuration
+		}
+		fmt.Printf("running with timeout %s\n", timeoutDuration)
+		var cancelFunc context.CancelFunc
+		ctx, cancelFunc = context.WithTimeout(ctx, timeoutDuration)
+		defer cancelFunc()
+	} else {
+		fmt.Println("running in continuous mode")
 	}
-	fmt.Printf("running with timeout %s\n", timeoutDuration)
-	ctx, cancelFunc := context.WithTimeout(ctx, timeoutDuration)
-	defer cancelFunc()
-	running := int32(1)
-	timeoutDuration = timeoutDuration - thinkTime
 
-	for atomic.LoadInt32(&running) == 1 {
-		cycleStartTime := time.Now()
+	for {
+		response.ResetCycleState()
 		waitGroup := &sync.WaitGroup{}
 		registry, err := s.listProjectEvents(ctx)
 		if err != nil {
@@ -122,15 +135,20 @@ func (s *service) dispatch(ctx context.Context, response *contract.Response) err
 			go s.dispatchEvents(ctx, waitGroup, response, projectEvents[i], registry.ScheduleBatches)
 		}
 		response.Cycles++
-		if err = s.logPerformance(ctx, response); err != nil {
-			shared.LogF("%v\n", err)
-		}
 
 		waitGroup.Add(1)
 		s.cleanupScheduled(ctx, registry.ScheduleBatches, waitGroup)
 
-		if !s.wait(ctx, cycleStartTime, waitGroup, &running, &timeoutDuration) {
+		if !s.wait(ctx, waitGroup) {
 			break
+		}
+
+		if err = s.logPerformance(ctx, response); err != nil {
+			shared.LogF("%v\n", err)
+		}
+
+		if s.cycleHook != nil {
+			s.cycleHook(time.Now())
 		}
 		for i := range projectEvents {
 			shared.LogF("%v\n", projectEvents[i].Performance)
@@ -230,12 +248,9 @@ func extractBatchDestProject(event astorage.Object) string {
 	return ""
 }
 
-func (s *service) wait(ctx context.Context, startTime time.Time, waitGroup *sync.WaitGroup, running *int32, remaining *time.Duration) bool {
+func (s *service) wait(ctx context.Context, waitGroup *sync.WaitGroup) bool {
 	select {
-	case <-time.After(*remaining):
-		return false
 	case <-ctx.Done():
-		atomic.StoreInt32(running, 0)
 		return false
 	case <-func() chan bool {
 		boolChannel := make(chan bool, 1)
@@ -245,16 +260,11 @@ func (s *service) wait(ctx context.Context, startTime time.Time, waitGroup *sync
 		}()
 		return boolChannel
 	}():
-		*remaining -= time.Now().Sub(startTime)
-		if *remaining <= 0 {
-			return false
-		}
 	}
 
 	select {
 	case <-time.After(2 * thinkTime):
 	case <-ctx.Done():
-		atomic.StoreInt32(running, 0)
 		return false
 	}
 	return true

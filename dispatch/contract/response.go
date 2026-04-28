@@ -70,6 +70,17 @@ func (r *Response) AddError(err error) {
 	r.SetIfError(err)
 }
 
+//ResetCycleState clears per-cycle dedup maps to prevent unbounded growth in long-lived processes.
+//Durable dedup is handled by GCS Move (jobs) and .wins generation:0 precondition (batches).
+func (r *Response) ResetCycleState() {
+	r.Jobs.mux.Lock()
+	defer r.Jobs.mux.Unlock()
+	r.Jobs.Jobs = make(map[string]*Job)
+	r.Batched = make(map[string]time.Time)
+	r.Errors = make([]string, 0)
+	r.Performance = make(map[string]*Performance)
+}
+
 //NewResponse creates a new response
 func NewResponse() *Response {
 	return &Response{
