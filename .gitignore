@@ -16,3 +16,4 @@ scratchpad/
 local_test.go
 *.tar.gz
 bqtail/bqtail
+go.sum
